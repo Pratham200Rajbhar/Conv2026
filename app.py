@@ -9,6 +9,7 @@ import numpy as np
 import pickle
 import json
 import cv2
+import requests
 import xgboost as xgb
 import warnings
 from sklearn.exceptions import InconsistentVersionWarning
@@ -79,6 +80,113 @@ def load_app_config():
 
 config = load_app_config()
 
+OPEN_METEO_GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+SOILGRIDS_PROPERTIES_QUERY_URL = "https://rest.isric.org/soilgrids/v2.0/properties/query"
+
+@st.cache_data(ttl=60 * 60 * 24)
+def geocode_place_candidates(place_name: str, count: int = 5):
+    params = {
+        "name": place_name,
+        "count": max(1, min(int(count), 25)),
+        "language": "en",
+        "format": "json",
+        "countryCode": "IN",
+    }
+    r = requests.get(OPEN_METEO_GEOCODE_URL, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("results") or []
+
+def _best_geocode_candidate(candidates: list[dict], state_hint: str | None):
+    if not candidates:
+        return None
+    if not state_hint:
+        return candidates[0]
+    state_hint_norm = state_hint.strip().lower()
+    for c in candidates:
+        admin1 = (c.get("admin1") or "").strip().lower()
+        if admin1 and admin1 == state_hint_norm:
+            return c
+    return candidates[0]
+
+def geocode_place(place_name: str, state_hint: str | None = None):
+    candidates = geocode_place_candidates(place_name, count=10)
+    top = _best_geocode_candidate(candidates, state_hint=state_hint)
+    if not top:
+        return None
+    return {
+        "name": top.get("name"),
+        "admin1": top.get("admin1"),
+        "country": top.get("country"),
+        "latitude": top.get("latitude"),
+        "longitude": top.get("longitude"),
+        "timezone": top.get("timezone"),
+        "raw": top,
+        "candidates": candidates,
+    }
+
+@st.cache_data(ttl=60 * 15)
+def fetch_open_meteo_hourly(latitude: float, longitude: float):
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": ",".join(
+            [
+                "temperature_2m",
+                "relative_humidity_2m",
+                "precipitation",
+                "wind_speed_10m",
+                "shortwave_radiation",
+            ]
+        ),
+        "timezone": "auto",
+        "forecast_days": 1,
+    }
+    r = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def _hourly_value_at_index(payload: dict, var: str, idx: int):
+    hourly = payload.get("hourly") or {}
+    arr = hourly.get(var) or []
+    if 0 <= idx < len(arr):
+        return arr[idx]
+    return None
+
+@st.cache_data(ttl=60 * 60 * 24)
+def fetch_soilgrids_properties(latitude: float, longitude: float):
+    # SoilGrids is occasionally rate-limited / down; keep this resilient.
+    params = {
+        "lat": latitude,
+        "lon": longitude,
+        "property": ["phh2o", "nitrogen", "soc", "clay", "sand", "silt"],
+        "depth": ["0-5cm"],
+        "value": ["mean"],
+    }
+    r = requests.get(SOILGRIDS_PROPERTIES_QUERY_URL, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def _soilgrids_mean_value(payload: dict, prop: str):
+    """
+    Returns the mean value at 0-5cm if present.
+    SoilGrids units vary by property (see docs). For phh2o, values are typically pH*10.
+    """
+    props = payload.get("properties") or {}
+    layers = props.get("layers") or []
+    for layer in layers:
+        if (layer.get("name") or "").lower() != prop.lower():
+            continue
+        depths = layer.get("depths") or []
+        for d in depths:
+            if (d.get("label") or "").lower() != "0-5cm":
+                continue
+            values = d.get("values") or {}
+            if "mean" in values:
+                return values["mean"]
+    return None
+
 # Load Yield Models
 @st.cache_resource
 def load_yield_resources():
@@ -135,20 +243,196 @@ if mode == "🌾 Crop Yield Prediction":
         year = st.number_input("Year", min_value=2000, max_value=2030, value=2024)
         area = st.number_input("Area (ha)", min_value=0.1, value=1.0)
 
+        st.divider()
+        st.caption("Make location more specific for better auto-fetch.")
+        location_mode = st.radio("Location mode", ["District/State", "Precise coordinates (recommended)"], horizontal=False)
+
+        if "latitude" not in st.session_state:
+            st.session_state["latitude"] = None
+        if "longitude" not in st.session_state:
+            st.session_state["longitude"] = None
+
+        if location_mode == "Precise coordinates (recommended)":
+            st.session_state["latitude"] = st.number_input(
+                "Latitude",
+                value=float(st.session_state["latitude"]) if st.session_state["latitude"] is not None else 23.0225,
+                format="%.6f",
+                help="Tip: paste from Google Maps.",
+            )
+            st.session_state["longitude"] = st.number_input(
+                "Longitude",
+                value=float(st.session_state["longitude"]) if st.session_state["longitude"] is not None else 72.5714,
+                format="%.6f",
+                help="Tip: paste from Google Maps.",
+            )
+        else:
+            place_query = st.text_input(
+                "Search place (try: 'District, State')",
+                value=f"{district}, {state}, India",
+            )
+            if st.button("Find coordinates for this place"):
+                try:
+                    candidates = geocode_place_candidates(place_query, count=10)
+                    if not candidates:
+                        st.warning("No geocoding results. Try adding 'India' or a nearby city name.")
+                    else:
+                        preferred = _best_geocode_candidate(candidates, state_hint=state)
+                        preferred_id = preferred.get("id") if isinstance(preferred, dict) else None
+                        opts = []
+                        for c in candidates:
+                            label = ", ".join(
+                                [p for p in [c.get("name"), c.get("admin1"), c.get("country")] if p]
+                            )
+                            opts.append((label, c))
+
+                        default_idx = 0
+                        if preferred_id is not None:
+                            for i, (_, c) in enumerate(opts):
+                                if c.get("id") == preferred_id:
+                                    default_idx = i
+                                    break
+
+                        chosen_label = st.selectbox(
+                            "Select the best match",
+                            options=[o[0] for o in opts],
+                            index=default_idx,
+                        )
+                        chosen = None
+                        for lbl, c in opts:
+                            if lbl == chosen_label:
+                                chosen = c
+                                break
+                        if chosen and chosen.get("latitude") is not None and chosen.get("longitude") is not None:
+                            st.session_state["latitude"] = float(chosen["latitude"])
+                            st.session_state["longitude"] = float(chosen["longitude"])
+                            st.success("Coordinates saved. You can now fetch weather/soil reliably.")
+                except requests.RequestException:
+                    st.warning("Could not reach the geocoding service right now.")
+                except Exception:
+                    st.warning("Geocoding failed. Try a different query.")
+
     with col2:
         st.subheader("🧪 Soil & Nutrition")
+        st.caption("Tip: Auto-fill soil pH and soil properties from SoilGrids when coordinates are available.")
+
+        if "soil_ph" not in st.session_state:
+            st.session_state["soil_ph"] = 7.0
+
+        auto_soil = st.checkbox("Auto-fill soil from live data (SoilGrids)", value=False)
+        if auto_soil and st.button("Fetch soil now"):
+            lat = st.session_state.get("latitude")
+            lon = st.session_state.get("longitude")
+            if lat is None or lon is None:
+                st.warning("Please set precise coordinates (Latitude/Longitude) first.")
+            else:
+                try:
+                    soil = fetch_soilgrids_properties(float(lat), float(lon))
+                    phh2o = _soilgrids_mean_value(soil, "phh2o")
+                    if phh2o is not None:
+                        # SoilGrids phh2o is commonly pH*10 in many layers
+                        ph_value = float(phh2o) / 10.0 if float(phh2o) > 14 else float(phh2o)
+                        st.session_state["soil_ph"] = max(0.0, min(14.0, ph_value))
+                        st.success("Soil pH loaded.")
+
+                    n_total = _soilgrids_mean_value(soil, "nitrogen")
+                    soc = _soilgrids_mean_value(soil, "soc")
+                    clay = _soilgrids_mean_value(soil, "clay")
+                    sand = _soilgrids_mean_value(soil, "sand")
+                    silt = _soilgrids_mean_value(soil, "silt")
+
+                    with st.expander("SoilGrids details (0-5cm)"):
+                        st.write(
+                            {
+                                "nitrogen": n_total,
+                                "soc": soc,
+                                "clay": clay,
+                                "sand": sand,
+                                "silt": silt,
+                                "note": "Units depend on SoilGrids layer definitions.",
+                            }
+                        )
+                except requests.RequestException:
+                    st.warning("Could not reach SoilGrids right now (it can be rate-limited / down).")
+                except Exception:
+                    st.warning("Soil fetch failed. Using manual inputs.")
+
         n_req = st.slider("Nitrogen Requirement (kg/ha)", 0, 300, 100)
         p_req = st.slider("Phosphorus Requirement (kg/ha)", 0, 300, 50)
         k_req = st.slider("Potassium Requirement (kg/ha)", 0, 300, 50)
-        ph = st.slider("Soil pH", 0.0, 14.0, 7.0)
+        ph = st.slider("Soil pH", 0.0, 14.0, float(st.session_state["soil_ph"]), key="soil_ph")
 
     with col3:
         st.subheader("☁️ Climate")
-        temp = st.slider("Temperature (°C)", -10, 60, 25)
-        hum = st.slider("Humidity (%)", 0, 100, 60)
-        rain = st.number_input("Rainfall (mm)", min_value=0.0, value=500.0)
-        wind = st.slider("Wind Speed (m/s)", 0.0, 50.0, 3.0)
-        solar = st.slider("Solar Radiation (MJ/m2/day)", 0.0, 40.0, 15.0)
+        st.caption("Tip: Auto-fill these from live weather (Open‑Meteo).")
+
+        if "temp_c" not in st.session_state:
+            st.session_state["temp_c"] = 25
+        if "hum_pct" not in st.session_state:
+            st.session_state["hum_pct"] = 60
+        if "rain_mm" not in st.session_state:
+            st.session_state["rain_mm"] = 500.0
+        if "wind_ms" not in st.session_state:
+            st.session_state["wind_ms"] = 3.0
+        if "solar_mj" not in st.session_state:
+            st.session_state["solar_mj"] = 15.0
+
+        auto_weather = st.checkbox("Auto-fill climate from live weather", value=False)
+        if auto_weather and st.button("Fetch live weather now"):
+            try:
+                lat = st.session_state.get("latitude")
+                lon = st.session_state.get("longitude")
+
+                if lat is None or lon is None:
+                    # Try a few queries because district names can be ambiguous.
+                    queries = [
+                        f"{district}, {state}, India",
+                        f"{district} district, {state}, India",
+                        f"{district}, India",
+                    ]
+                    geo = None
+                    for q in queries:
+                        geo = geocode_place(q, state_hint=state)
+                        if geo and geo.get("latitude") is not None and geo.get("longitude") is not None:
+                            break
+                    if not geo or geo.get("latitude") is None or geo.get("longitude") is None:
+                        st.warning("Could not find coordinates. Add precise Latitude/Longitude for best results.")
+                        geo = None
+                    else:
+                        lat = float(geo["latitude"])
+                        lon = float(geo["longitude"])
+                        st.session_state["latitude"] = lat
+                        st.session_state["longitude"] = lon
+
+                if lat is None or lon is None:
+                    st.warning("Using manual climate inputs.")
+                else:
+                    wx = fetch_open_meteo_hourly(float(lat), float(lon))
+                    times = (wx.get("hourly") or {}).get("time") or []
+                    idx = 0
+
+                    st.session_state["temp_c"] = float(_hourly_value_at_index(wx, "temperature_2m", idx) or st.session_state["temp_c"])
+                    st.session_state["hum_pct"] = int(round(float(_hourly_value_at_index(wx, "relative_humidity_2m", idx) or st.session_state["hum_pct"])))
+                    st.session_state["rain_mm"] = float(_hourly_value_at_index(wx, "precipitation", idx) or st.session_state["rain_mm"])
+                    st.session_state["wind_ms"] = float(_hourly_value_at_index(wx, "wind_speed_10m", idx) or st.session_state["wind_ms"])
+
+                    # NOTE: Open‑Meteo shortwave_radiation is hourly W/m². We keep it as a rough proxy
+                    # by mapping the current hour value into the existing "solar" field.
+                    st.session_state["solar_mj"] = float(_hourly_value_at_index(wx, "shortwave_radiation", idx) or st.session_state["solar_mj"])
+
+                    if st.session_state.get("latitude") is not None and st.session_state.get("longitude") is not None:
+                        st.success("Weather loaded for saved coordinates.")
+                    if times:
+                        st.caption(f"Using forecast hour: {times[idx]}")
+            except requests.RequestException:
+                st.warning("Could not reach Open‑Meteo. Using manual climate inputs.")
+            except Exception:
+                st.warning("Weather fetch failed. Using manual climate inputs.")
+
+        temp = st.slider("Temperature (°C)", -10, 60, int(round(float(st.session_state["temp_c"]))), key="temp_c")
+        hum = st.slider("Humidity (%)", 0, 100, int(st.session_state["hum_pct"]), key="hum_pct")
+        rain = st.number_input("Rainfall (mm)", min_value=0.0, value=float(st.session_state["rain_mm"]), key="rain_mm")
+        wind = st.slider("Wind Speed (m/s)", 0.0, 50.0, float(st.session_state["wind_ms"]), key="wind_ms")
+        solar = st.slider("Solar Radiation (MJ/m2/day)", 0.0, 40.0, float(st.session_state["solar_mj"]), key="solar_mj")
 
     if st.button("🚀 Predict Yield"):
         try:
