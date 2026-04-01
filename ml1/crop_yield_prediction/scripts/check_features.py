@@ -1,7 +1,9 @@
 import pickle
 import os
 
-models_dir = "/work/Convergance Hackathon/models/ML_Yield_Project/models"
+# Updated path to reflect new organization
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+models_dir = os.path.join(BASE_DIR, "models")
 
 def load_pkl(filename):
     path = os.path.join(models_dir, filename)
