@@ -162,7 +162,7 @@ Thumbs.db
 # Models and Large Binaries
 **/*.bin
 **/*.pth
-**/*.weights
+**/* .weights
 **/*.h5
 **/*.pt
 **/*.onnx
